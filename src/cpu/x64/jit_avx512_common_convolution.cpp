@@ -34,12 +34,14 @@ using namespace nstl;
 
 using jit_conv_ker_t = void (*)(jit_conv_call_s *);
 
+// prf stands for prefetch
 #define PIPELINE(field) \
     do { \
         p.field = p.field##_prf; \
         p.field##_prf = field; \
     } while (0)
 
+// so all those args are prefetch for next loop?
 inline void jit_conv_ker_pipeline(const jit_conv_ker_t ker, jit_conv_call_s &p,
         const void *src, const void *dst, const void *filt, const void *bias,
         int channel, int kh_padding, int reduce_work, int load_work) {
@@ -354,32 +356,59 @@ void jit_avx512_common_convolution_fwd_t<src_type, wei_type,
     const jit_conv_ker_t jit_ker = (decltype(jit_ker))kernel_->jit_ker();
     assert(jcp.nb_oc % jcp.nb_oc_blocking == 0);
 
-    int oc_chunks = jcp.nb_oc / jcp.nb_oc_blocking;
+    // jcp.nb_oc: # of oc block
+    // jcp.oc_block: single block size
+    // oc_chunks: # of oc chunks
+    // what's nb_oc_blocking???
+    int oc_chunks = jcp.nb_oc / jcp.nb_oc_blocking; // = nb_oc
     int g_blocking = 1;
-    int nb_groups = jcp.ngroups / g_blocking;
+    int nb_groups = jcp.ngroups / g_blocking; // = 1
+    // jcp.nb_ow: # of ow block
+    // each ow block is considered as one work, so inside ow block work must be executed in parallel (in many register I assmue)
+    // so a single output channel would have jcp.oh * jcp.nb_ow works
+    // since it is also vectorized in oc direction, in all output channels the amount of work is oc_chunks * jcp.oh * jcp.nb_ow
+    // this is the work amount for each ic block, so in each ic block, the this same work amount has to be done
+    // so the outter loop is for ic block
     int work_amount = jcp.mb * nb_groups * oc_chunks * jcp.oh * jcp.nb_ow;
-    int nthr = jcp.aligned_threads;
+    int nthr = jcp.aligned_threads; // = 1
 
+    // overall loop order:
+    // 1) loop ic block 
+    // 2) loop oc block, implicitly loop n
+    // 3) loop oh block
+    // 4) loop inside one ic block
+    // 5) loop inside one oh block
     parallel(nthr, [&](const int ithr, const int nthr) {
         int start {0}, end {0}, start_copy;
+        // start = 0, end = work_amount when nthr = 1
         balance211(work_amount, nthr, ithr, start, end);
+        // to backup start
         start_copy = start;
 
         auto par_conv = jit_conv_call_s();
-        size_t src_h_stride = src_d.blk_off(0, 0, 1);
+        // this is the stride you think
+        size_t src_h_stride = src_d.blk_off(0, 0, 1); // nchw, so no repack/transformation for input?
         size_t src_c_stride = src_d.blk_off(0, 1);
         size_t dst_h_stride = dst_d.blk_off(0, 0, 1);
-        size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
+        size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1); // CoCiHW, the first 0 is for group
         size_t wht_ic_stride = wht_blk_off(weights_d, 0, 0, 1);
 
+        // jcp.nb_ic: # of ic block
+        // loop through ic blocks
         for (int icb_l2 = 0; icb_l2 < jcp.nb_ic; icb_l2 += jcp.nb_ic_L2) {
+            // reset start
             start = start_copy;
+            // occ: the index of oc chunk
+            // owb: the index of ow block
             int n {0}, gg {0}, occ {0}, oh_s {0}, owb {0};
 
             if (jcp.loop_order == loop_cwgn)
                 nd_iterator_init(start, occ, oc_chunks, owb, jcp.nb_ow, gg,
                         nb_groups, n, jcp.mb, oh_s, jcp.oh);
-            else if (jcp.loop_order == loop_gncw)
+            else if (jcp.loop_order == loop_gncw) // this is the case
+                // so in gncw, c is output channel block
+                // loop gncw inside ic block
+                // so these vars are same in different ic blocks
                 nd_iterator_init(start, gg, nb_groups, n, jcp.mb, occ,
                         oc_chunks, owb, jcp.nb_ow, oh_s, jcp.oh);
             else if (jcp.loop_order == loop_nhwcg)
@@ -388,65 +417,102 @@ void jit_avx512_common_convolution_fwd_t<src_type, wei_type,
             else
                 assert(!"unsupported loop order");
 
+            // loop through oc blocks
             while (start < end) {
-                int ocb = occ * jcp.nb_oc_blocking;
-                int g = gg * g_blocking;
-                int g_ocb = g * jcp.nb_oc + ocb;
-                int g_icb = g * jcp.nb_ic * jcp.nonblk_group_off;
+                int ocb = occ * jcp.nb_oc_blocking; // = occ when nb_oc_blocking = 1
+                int g = gg * g_blocking; // = 0
+                int g_ocb = g * jcp.nb_oc + ocb; // = ocb when g = 0
+                int g_icb = g * jcp.nb_ic * jcp.nonblk_group_off; // = 0
 
+                // work remain
                 int work_rem = end - start;
 
+                // start of ow block
                 int ow_s = owb * jcp.ow_block;
+                // start of iw block
                 int iw_s = ow_s * jcp.stride_w;
-                int oh_e = oh_s + work_rem > jcp.oh ? jcp.oh : oh_s + work_rem;
-                if (jcp.loop_order == loop_nhwcg)
-                    oh_e = oh_s + 1; //step instead
+                int oh_e = oh_s + work_rem > jcp.oh ? jcp.oh : oh_s + work_rem; // = jcp.oh
 
+                // ignore
+                // if (jcp.loop_order == loop_nhwcg)
+                //     oh_e = oh_s + 1; //step instead
+
+                // loop through oh blocks
+                // b is for block
+                // oh_s = 0
+                // so in this loop the whole output image is covered
                 for (int oh_b = oh_s; oh_b < oh_e; oh_b += jcp.h_blocking) {
-                    int ih_b = -jcp.t_pad + oh_b * jcp.stride_h;
+                    int ih_b = -jcp.t_pad + oh_b * jcp.stride_h; // so jcp.t_pad must be greater than 0
                     const bool is_dst_layout_nxc
-                            = jcp.dst_tag == format_tag::nhwc;
-                    const int oc_off_idx = is_dst_layout_nxc
+                            = jcp.dst_tag == format_tag::nhwc; // = false
+                    // the index of oc block
+                    const int oc_off_idx = is_dst_layout_nxc // = g_ocb = ocb = occ
                             ? g * jcp.oc + ocb * jcp.oc_block
                             : g_ocb;
+                    // given nchw find the dst to write to, this is the start of a ow block, hence the suffix _w
                     auto dst_w = dst + dst_d.blk_off(n, oc_off_idx, oh_b, ow_s);
                     const bool is_src_layout_nxc
-                            = jcp.src_tag == format_tag::nhwc;
+                            = jcp.src_tag == format_tag::nhwc; // = false
                     const int ic_off_idx = is_src_layout_nxc
                             ? g * jcp.ic + icb_l2 * jcp.ic_block
-                            : g_icb + icb_l2;
+                            : g_icb + icb_l2; // = icb_l2
+                    // to the block granularity, used as the initial point for looping inside a block
+                    // the same goes for dst_w
                     auto src_w = src + src_d.blk_off(n, ic_off_idx, ih_b, iw_s);
                     auto wht_w
                             = weights + wht_blk_off(weights_d, g, ocb, icb_l2);
 
-                    int icb_step = is_src_layout_nxc ? jcp.nb_ic_L2 : 1;
+                    // inside a ic block, loop ic one by one
+                    int icb_step = is_src_layout_nxc ? jcp.nb_ic_L2 : 1; // = 1
                     int icb_end = min(jcp.nb_ic, icb_l2 + jcp.nb_ic_L2);
-                    auto bias_w = bias ? bias
-                                    + oc_off_idx
-                                            * (is_dst_layout_nxc ? 1
-                                                                 : jcp.oc_block)
-                                       : nullptr;
+
+
+                    // ignore for now
+                    // auto bias_w = bias ? bias
+                                    // + oc_off_idx
+                                            // * (is_dst_layout_nxc ? 1
+                                                                 // : jcp.oc_block)
+                                       // : nullptr;
+
+                    // oc_work for one oc block
                     const int oc_work = utils::this_block_size(
                             ocb * jcp.oc_block, jcp.oc_without_padding,
-                            jcp.nb_oc_blocking * jcp.oc_block);
+                            jcp.nb_oc_blocking * jcp.oc_block); // = jcp.oc_block
+                    // l stands for???
                     const int oc_l_off = oc_off_idx
-                            * (is_dst_layout_nxc ? 1 : jcp.oc_block);
-                    int ic_work = icb_step * jcp.ic_block;
+                            * (is_dst_layout_nxc ? 1 : jcp.oc_block); // = oc_off_idx * jcp.oc_block
+                    // ic work for a ic block
+                    int ic_work = icb_step * jcp.ic_block; // = jcp.ic_block
+                    // loop through 1 ic block
                     for (int icb = icb_l2; icb < icb_end; icb += icb_step) {
-                        int curr_nb_ic = nstl::min(icb_step, icb_end - icb);
-                        int flags = 0;
-                        if (icb == 0) flags |= FLAG_IC_FIRST;
-                        if (icb + curr_nb_ic >= jcp.nb_ic) {
-                            flags |= FLAG_IC_LAST;
-                            ic_work = utils::this_block_size(icb * jcp.ic_block,
-                                    jcp.ic, icb_step * jcp.ic_block);
-                        }
+                        int curr_nb_ic = nstl::min(icb_step, icb_end - icb); // = 1
+
+
+                        // ignore for now
+                        // int flags = 0;
+                        // if (icb == 0) flags |= FLAG_IC_FIRST;
+                        // if (icb + curr_nb_ic >= jcp.nb_ic) {
+                        //     flags |= FLAG_IC_LAST;
+                        //     ic_work = utils::this_block_size(icb * jcp.ic_block,
+                        //             jcp.ic, icb_step * jcp.ic_block);
+                        // }
+
+
                         auto src_c = src_w;
                         auto dst_c = dst_w;
+                        // loop through 1 oh block
+                        // it seems that jcp.h_blocking depends on L2 size
+                        // rather than # of registers.
+                        // j is for looping h axis
+                        // b stands for begin
                         for (int oj = oh_b, ij = ih_b;
                                 oj < min(oh_e, oh_b + jcp.h_blocking);
                                 ++oj, ij += jcp.stride_h) {
-                            int dilate_h = jcp.dilate_h + 1;
+                            int dilate_h = jcp.dilate_h + 1; // dilate_h has to be 1, so why the heck is jcp.dilate_h = 0
+                            // t stands for top
+                            // i_t_overflow: # of zeros to pad on the top
+                            // if ij > 0 i_t_overflow = 0
+                            // if ij < 0 i_t_overflow = -ij
                             int i_t_overflow = div_up(max(0, -ij), dilate_h);
                             int i_b_overflow = div_up(
                                     max(0,
@@ -454,19 +520,24 @@ void jit_avx512_common_convolution_fwd_t<src_type, wei_type,
                                                     + (jcp.kh - 1) * dilate_h
                                                     + 1),
                                     dilate_h);
+                            // ??? 
                             int kh_padding = nstl::max(
                                     0, jcp.kh - i_t_overflow - i_b_overflow);
 
-                            auto aux_src = src_c
-                                    + i_t_overflow * dilate_h * src_h_stride;
-                            auto aux_wht = wht_w + i_t_overflow * wht_h_stride;
+                            // what happens for padding?
+                            // ???
+                            // so aux_xx has to be the value for the next loop
+                            auto aux_src = src_c 
+                                    + i_t_overflow * dilate_h * src_h_stride; // = src_c if ij > 0
+                            auto aux_wht = wht_w + i_t_overflow * wht_h_stride; // = wht_w if ij > 0
 
                             jit_conv_ker_pipeline_ow_thr(jit_ker, par_conv,
-                                    aux_src, dst_c, aux_wht, bias_w, icb,
+                                    aux_src, dst_c, aux_wht, bias_w, icb, // icb: start channel block? instead of an absolute value
                                     kh_padding, owb, ic_work, oc_work,
                                     post_ops_binary_rhs_arg_vec.data(),
                                     oc_l_off, dst, flags);
 
+                            // c for channel?
                             src_c += src_h_stride * jcp.stride_h;
                             dst_c += dst_h_stride;
                         }
@@ -479,6 +550,9 @@ void jit_avx512_common_convolution_fwd_t<src_type, wei_type,
                     nd_iterator_jump(start, end, occ, oc_chunks, owb, jcp.nb_ow,
                             gg, nb_groups, n, jcp.mb, oh_s, jcp.oh);
                 else if (jcp.loop_order == loop_gncw)
+                    // ideally jump one oc chunk each time
+                    // reset oh_s to 0
+                    // increment n when occ reaches oc_chunks
                     nd_iterator_jump(start, end, gg, nb_groups, n, jcp.mb, occ,
                             oc_chunks, owb, jcp.nb_ow, oh_s, jcp.oh);
                 else if (jcp.loop_order == loop_nhwcg) {
